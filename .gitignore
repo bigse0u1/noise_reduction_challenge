@@ -1,0 +1,8 @@
+.venv/
+.DS_Store
+.ipynb_checkpoints/
+__pycache__/
+
+# 공개 데이터는 각자 로컬에서 사용 (저장소에 올리지 않음)
+train/
+validation/
