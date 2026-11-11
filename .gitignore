@@ -1,5 +1,6 @@
 .venv/
 .DS_Store
+Icon?
 .ipynb_checkpoints/
 __pycache__/
 
@@ -9,3 +10,6 @@ validation/
 
 # 공지 파일
 notice.md
+
+# 노트북 실행 결과 (제출할 결과는 따로 복사해서 올림)
+outputs/
