@@ -6,9 +6,10 @@ input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 
 
 잡음 제거 과정은 Noisy 입력만 사용한다 (Clean 은 사용하지 않는다).
 제공된 베이스라인의 Wiener Filter 에서 아래를 바꾸었다.
-  - 잡음 PSD: 저에너지 프레임 10% 의 평균 파워 (3-bin 평활화)
+  - STFT: 512 -> 1024 samples (64 ms), 잡음의 미세한 주파수 구조를 더 잘 분해
+  - 잡음 PSD: 저에너지 프레임 15% 의 평균 파워 (주파수 평활 없음)
   - 사전 SNR: decision-directed 추정 (Ephraim & Malah, 1984), 평활 계수 0.97
-  - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.15
+  - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.10
 """
 import argparse
 from pathlib import Path
@@ -16,17 +17,16 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from scipy import signal
-from scipy.ndimage import uniform_filter1d
 from scipy.special import exp1
 
 ROOT = Path(__file__).resolve().parent
 
 # ---- 알고리즘 파라미터 ----
-N_FFT = 512             # 16 kHz 에서 32 ms
-HOP = 128               # 8 ms (75% overlap)
-NOISE_FRACTION = 0.10   # 잡음 추정에 쓰는 저에너지 프레임 비율
+N_FFT = 1024            # 16 kHz 에서 64 ms
+HOP = 128               # 8 ms (87.5% overlap)
+NOISE_FRACTION = 0.15   # 잡음 추정에 쓰는 저에너지 프레임 비율
 SNR_SMOOTHING = 0.97    # decision-directed 평활 계수 a
-GAIN_FLOOR = 0.15       # 이득 하한 g_min
+GAIN_FLOOR = 0.10       # 이득 하한 g_min
 
 
 def stft(x: np.ndarray, sr: int):
@@ -58,7 +58,8 @@ def estimate_noise_power(z: np.ndarray, times: np.ndarray, length: int, sr: int)
     count = max(1, int(np.ceil(NOISE_FRACTION * len(full))))
     selected = full[np.argsort(energy, kind="stable")[:count]]
     estimate = power[:, selected].mean(axis=1)
-    return np.maximum(uniform_filter1d(estimate, size=3, mode="nearest"), 1e-18)
+    # 주파수 평활을 하지 않는다: 잡음의 미세한 스펙트럼 구조를 유지하는 쪽이 PESQ 가 높았다.
+    return np.maximum(estimate, 1e-18)
 
 
 def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:

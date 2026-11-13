@@ -41,19 +41,19 @@ python denoise.py --input <입력 폴더> --output <출력 폴더>
 
 log-MMSE 이득 + decision-directed 사전 SNR 추정
 
-1. 16 kHz 음성을 STFT로 변환합니다. (Hann 창 512 samples, hop 128 samples)
-2. 에너지가 가장 낮은 프레임 10%의 평균 파워로 잡음 PSD를 추정하고, 3-bin 평활화합니다.
+1. 16 kHz 음성을 STFT로 변환합니다. (Hann 창 1024 samples = 64 ms, hop 128 samples)
+2. 에너지가 가장 낮은 프레임 15%의 평균 파워로 잡음 PSD를 추정합니다. (주파수 평활은 하지 않습니다.)
 3. 프레임마다 decision-directed 방식으로 사전 SNR ξ를 추정합니다. (이전 프레임의 처리 결과와 현재 사후 SNR의 가중 평균)
-4. log-MMSE 이득 `G = ξ/(1+ξ) · exp(½ E1(v))`, `v = ξ/(1+ξ) · γ` 를 구하고 이득 하한 0.15를 적용합니다.
+4. log-MMSE 이득 `G = ξ/(1+ξ) · exp(½ E1(v))`, `v = ξ/(1+ξ) · γ` 를 구하고 이득 하한 0.10을 적용합니다.
 5. 입력 위상을 유지한 채 역 STFT로 파형을 복원합니다.
 
 | 파라미터 | 값 |
 | :--- | ---: |
-| `N_FFT` | 512 |
+| `N_FFT` | 1024 |
 | `HOP` | 128 |
-| `NOISE_FRACTION` | 0.10 |
+| `NOISE_FRACTION` | 0.15 |
 | `SNR_SMOOTHING` | 0.97 |
-| `GAIN_FLOOR` | 0.15 |
+| `GAIN_FLOOR` | 0.10 |
 
 파라미터는 [denoise.py](denoise.py) 상단에 있으며, Train 데이터에서 튜닝하고 Validation으로 확인했습니다.
 
@@ -63,8 +63,8 @@ Validation 164개 파일의 평균입니다. (PESQ: 16 kHz wideband)
 
 | 항목 | Noisy | 제출 버전 |
 | :--- | ---: | ---: |
-| PESQ-WB | 1.3947 | 1.7431 |
-| SNR (dB) | 9.6341 | 13.4270 |
+| PESQ-WB | 1.3947 | 1.8210 |
+| SNR (dB) | 9.6341 | 14.2968 |
 
 파일별 결과는 [validation_results.csv](validation_results.csv) 에 있습니다.
 
