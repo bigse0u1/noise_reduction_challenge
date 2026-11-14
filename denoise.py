@@ -1,4 +1,4 @@
-"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed).
+"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed, 하모닉 재생성).
 
 input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 저장한다.
 
@@ -9,7 +9,9 @@ input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 
   - STFT: 512 -> 1024 samples (64 ms), 잡음의 미세한 주파수 구조를 더 잘 분해
   - 잡음 PSD: 저에너지 프레임 15% 의 평균 파워 (주파수 평활 없음)
   - 사전 SNR: decision-directed 추정 (Ephraim & Malah, 1984), 평활 계수 0.97
-  - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.10
+  - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.01
+  - 하모닉 재생성 (Plapous et al., 2006 의 HRNR 을 단순화): 1단계 결과에 반파 정류를 적용해
+    제거된 하모닉을 복원한 스펙트럼으로 사전 SNR 을 다시 추정하고 이득을 한 번 더 구한다.
 """
 import argparse
 from pathlib import Path
@@ -26,7 +28,9 @@ N_FFT = 1024            # 16 kHz 에서 64 ms
 HOP = 128               # 8 ms (87.5% overlap)
 NOISE_FRACTION = 0.15   # 잡음 추정에 쓰는 저에너지 프레임 비율
 SNR_SMOOTHING = 0.97    # decision-directed 평활 계수 a
-GAIN_FLOOR = 0.10       # 이득 하한 g_min
+GAIN_FLOOR = 0.01       # 이득 하한 g_min
+HARMONIC_SCALE = 0.5    # 재생성 하모닉 파워의 크기 (1단계 파워 대비)
+HARMONIC_MIX = 0.5      # 2단계 사전 SNR 에서 1단계 파워가 차지하는 비중 ρ
 
 
 def stft(x: np.ndarray, sr: int):
@@ -62,6 +66,13 @@ def estimate_noise_power(z: np.ndarray, times: np.ndarray, length: int, sr: int)
     return np.maximum(estimate, 1e-18)
 
 
+def log_mmse_gain(prior_snr: np.ndarray, posterior_snr: np.ndarray) -> np.ndarray:
+    """log-MMSE 이득: G = ξ/(1+ξ) · exp(½ E1(v)),  v = ξ/(1+ξ) · γ  (하한 적용)."""
+    wiener = prior_snr / (1 + prior_snr)
+    v = np.maximum(wiener * posterior_snr, 1e-8)
+    return np.clip(wiener * np.exp(0.5 * exp1(v)), GAIN_FLOOR, 1)
+
+
 def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
     """1채널 Noisy 파형을 받아 같은 길이의 잡음 제거 파형을 반환한다."""
     x = np.asarray(noisy, dtype=np.float64)
@@ -70,7 +81,8 @@ def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
     noise = estimate_noise_power(z, times, len(x), sr)
     posterior_snr = power / noise[:, None]
 
-    enhanced = np.empty_like(z)
+    # 1단계: decision-directed 사전 SNR + log-MMSE 이득
+    stage1 = np.empty_like(z)
     previous_clean_power = np.zeros_like(noise)
     for frame in range(z.shape[1]):
         instantaneous = np.maximum(posterior_snr[:, frame] - 1.0, 0.0)
@@ -79,13 +91,21 @@ def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
         else:
             prior_snr = (SNR_SMOOTHING * previous_clean_power / noise
                          + (1 - SNR_SMOOTHING) * instantaneous)
-        # log-MMSE 이득: G = ξ/(1+ξ) · exp(½ E1(v)),  v = ξ/(1+ξ) · γ
-        wiener = prior_snr / (1 + prior_snr)
-        v = np.maximum(wiener * posterior_snr[:, frame], 1e-8)
-        gain = np.clip(wiener * np.exp(0.5 * exp1(v)), GAIN_FLOOR, 1)
-        enhanced[:, frame] = gain * z[:, frame]
-        previous_clean_power = np.abs(enhanced[:, frame]) ** 2
-    return istft(enhanced, len(x), sr)
+        gain = log_mmse_gain(prior_snr, posterior_snr[:, frame])
+        stage1[:, frame] = gain * z[:, frame]
+        previous_clean_power = np.abs(stage1[:, frame]) ** 2
+
+    # 2단계: 하모닉 재생성. 반파 정류(비선형)가 제거된 하모닉 성분을 다시 만들어 낸다.
+    regenerated = np.maximum(istft(stage1, len(x), sr), 0.0)
+    _, _, z_regen = stft(regenerated, sr)
+    stage1_power = np.abs(stage1) ** 2
+    regen_power = np.abs(z_regen) ** 2
+    harmonic_power = (regen_power * HARMONIC_SCALE
+                      * stage1_power.sum() / max(regen_power.sum(), 1e-18))
+    prior_snr = (HARMONIC_MIX * stage1_power
+                 + (1 - HARMONIC_MIX) * harmonic_power) / noise[:, None]
+    gain = log_mmse_gain(prior_snr, posterior_snr)
+    return istft(gain * z, len(x), sr)
 
 
 def process_file(src: Path, dst: Path) -> None:
