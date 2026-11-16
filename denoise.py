@@ -1,4 +1,4 @@
-"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed, 하모닉 재생성).
+"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed, 하모닉 재생성, 다중 해상도, 잔차 기반 잡음 재추정).
 
 input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 저장한다.
 
@@ -6,12 +6,15 @@ input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 
 
 잡음 제거 과정은 Noisy 입력만 사용한다 (Clean 은 사용하지 않는다).
 제공된 베이스라인의 Wiener Filter 에서 아래를 바꾸었다.
-  - STFT: 512 -> 1024 samples (64 ms), 잡음의 미세한 주파수 구조를 더 잘 분해
-  - 잡음 PSD: 저에너지 프레임 15% 의 평균 파워 (주파수 평활 없음)
+  - STFT: 512 -> 768~3072 samples, 잡음의 미세한 주파수 구조를 더 잘 분해
+  - 잡음 PSD: 저에너지 프레임 15% 의 평균 파워 x 1.25 보정 (주파수 평활 없음)
   - 사전 SNR: decision-directed 추정 (Ephraim & Malah, 1984), 평활 계수 0.97
   - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.01
   - 하모닉 재생성 (Plapous et al., 2006 의 HRNR 을 단순화): 1단계 결과에 반파 정류를 적용해
     제거된 하모닉을 복원한 스펙트럼으로 사전 SNR 을 다시 추정하고 이득을 한 번 더 구한다.
+  - 다중 해상도: STFT 창 길이 5가지(768~3072)로 각각 처리한 결과를 평균
+  - 잔차 기반 잡음 재추정: 1차 결과가 제거한 성분(잔차)의 파워를 시간 평활해
+    시간에 따라 변하는 잡음 PSD 를 만들고, 이것으로 전체 과정을 한 번 더 수행
 """
 import argparse
 from pathlib import Path
@@ -19,43 +22,52 @@ from pathlib import Path
 import numpy as np
 import soundfile as sf
 from scipy import signal
+from scipy.ndimage import uniform_filter1d
 from scipy.special import exp1
 
 ROOT = Path(__file__).resolve().parent
 
 # ---- 알고리즘 파라미터 ----
-N_FFT = 1024            # 16 kHz 에서 64 ms
-HOP = 128               # 8 ms (87.5% overlap)
+FFT_SIZES = (768, 1024, 1536, 2048, 3072)  # 다중 해상도: 창 길이 48~192 ms (16 kHz)
+HOP_DIVISOR = 8         # hop = 창 길이 / 8 (87.5% overlap)
 NOISE_FRACTION = 0.15   # 잡음 추정에 쓰는 저에너지 프레임 비율
+NOISE_SCALE = 1.25      # 잡음 PSD 보정 계수 (저에너지 프레임 선택으로 낮게 치우치는 추정을 보정)
 SNR_SMOOTHING = 0.97    # decision-directed 평활 계수 a
 GAIN_FLOOR = 0.01       # 이득 하한 g_min
 HARMONIC_SCALE = 0.5    # 재생성 하모닉 파워의 크기 (1단계 파워 대비)
 HARMONIC_MIX = 0.5      # 2단계 사전 SNR 에서 1단계 파워가 차지하는 비중 ρ
+RESIDUAL_EXPONENT = 4      # 잔차 파워 (1 - g²)^p · |Y|² 의 지수 p
+RESIDUAL_SMOOTH_MS = 600   # 잔차 파워의 시간 평활 길이
+RESIDUAL_WEIGHT = 0.85     # 잔차 기반 잡음 PSD 의 비중 (나머지는 고정 잡음 PSD, 로그 영역 혼합)
+RESIDUAL_LIMIT = 8.0       # 잔차 기반 잡음 PSD 의 허용 범위 (고정 잡음 PSD 의 1/8 ~ 8배)
 
 
-def stft(x: np.ndarray, sr: int):
-    if x.size < N_FFT:
-        x = np.pad(x, (0, N_FFT - x.size))
-    return signal.stft(x, fs=sr, window="hann", nperseg=N_FFT,
-                       noverlap=N_FFT - HOP, nfft=N_FFT,
+def stft(x: np.ndarray, sr: int, n_fft: int):
+    if x.size < n_fft:
+        x = np.pad(x, (0, n_fft - x.size))
+    hop = n_fft // HOP_DIVISOR
+    return signal.stft(x, fs=sr, window="hann", nperseg=n_fft,
+                       noverlap=n_fft - hop, nfft=n_fft,
                        boundary="zeros", padded=True)
 
 
-def istft(z: np.ndarray, length: int, sr: int) -> np.ndarray:
-    _, y = signal.istft(z, fs=sr, window="hann", nperseg=N_FFT,
-                        noverlap=N_FFT - HOP, nfft=N_FFT,
+def istft(z: np.ndarray, length: int, sr: int, n_fft: int) -> np.ndarray:
+    hop = n_fft // HOP_DIVISOR
+    _, y = signal.istft(z, fs=sr, window="hann", nperseg=n_fft,
+                        noverlap=n_fft - hop, nfft=n_fft,
                         input_onesided=True, boundary=True)
     if len(y) < length:
         raise ValueError("역 STFT 결과가 입력보다 짧습니다.")
     return y[:length]
 
 
-def estimate_noise_power(z: np.ndarray, times: np.ndarray, length: int, sr: int) -> np.ndarray:
+def estimate_noise_power(z: np.ndarray, times: np.ndarray, length: int, sr: int,
+                         n_fft: int) -> np.ndarray:
     """에너지가 가장 낮은 완전한 프레임들의 평균 파워로 잡음 PSD 를 추정한다."""
     power = np.abs(z) ** 2
     # 경계 padding 으로 인위적으로 조용해진 프레임은 제외한다.
     centers = np.rint(times * sr).astype(int)
-    full = np.flatnonzero((centers >= N_FFT // 2) & (centers + N_FFT // 2 <= length))
+    full = np.flatnonzero((centers >= n_fft // 2) & (centers + n_fft // 2 <= length))
     if not len(full):
         full = np.arange(power.shape[1])
     energy = power[:, full].mean(axis=0)
@@ -63,7 +75,7 @@ def estimate_noise_power(z: np.ndarray, times: np.ndarray, length: int, sr: int)
     selected = full[np.argsort(energy, kind="stable")[:count]]
     estimate = power[:, selected].mean(axis=1)
     # 주파수 평활을 하지 않는다: 잡음의 미세한 스펙트럼 구조를 유지하는 쪽이 PESQ 가 높았다.
-    return np.maximum(estimate, 1e-18)
+    return np.maximum(estimate * NOISE_SCALE, 1e-18)
 
 
 def log_mmse_gain(prior_snr: np.ndarray, posterior_snr: np.ndarray) -> np.ndarray:
@@ -73,39 +85,72 @@ def log_mmse_gain(prior_snr: np.ndarray, posterior_snr: np.ndarray) -> np.ndarra
     return np.clip(wiener * np.exp(0.5 * exp1(v)), GAIN_FLOOR, 1)
 
 
-def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
-    """1채널 Noisy 파형을 받아 같은 길이의 잡음 제거 파형을 반환한다."""
-    x = np.asarray(noisy, dtype=np.float64)
-    _, times, z = stft(x, sr)
+def residual_noise_power(power: np.ndarray, first_pass: np.ndarray, fixed: np.ndarray,
+                         sr: int, n_fft: int) -> np.ndarray:
+    """1차 결과가 제거한 성분(잔차)의 파워를 시간 평활해 시간에 따라 변하는 잡음 PSD 를 만든다.
+
+    칸마다 1차 결과가 남긴 파워 비율 g² = |S1|²/|Y|² 를 구하고, (1 - g²)^p · |Y|² 를 잔차 파워로 쓴다.
+    p 가 클수록 음성이 남아 있는 칸의 잡음을 낮게 잡아 음성을 보호한다.
+    """
+    _, _, z_first = stft(first_pass, sr, n_fft)
+    kept = np.clip(np.abs(z_first) ** 2 / np.maximum(power, 1e-18), 0.0, 1.0)
+    residual_power = (1.0 - kept) ** RESIDUAL_EXPONENT * power
+    hop_ms = 1000.0 * (n_fft // HOP_DIVISOR) / sr
+    frames = max(3, int(round(RESIDUAL_SMOOTH_MS / hop_ms)))
+    varying = uniform_filter1d(residual_power, frames, axis=1, mode="nearest")
+    varying = np.clip(varying, fixed / RESIDUAL_LIMIT, fixed * RESIDUAL_LIMIT)
+    return fixed ** (1 - RESIDUAL_WEIGHT) * varying ** RESIDUAL_WEIGHT
+
+
+def denoise_single(x: np.ndarray, sr: int, n_fft: int, first_pass: np.ndarray | None = None) -> np.ndarray:
+    """창 길이 하나(n_fft)로 2단계 잡음 제거를 수행한다.
+
+    first_pass(1차 결과 파형)가 주어지면 잔차 기반의 시간 가변 잡음 PSD 를 사용한다.
+    """
+    _, times, z = stft(x, sr, n_fft)
     power = np.abs(z) ** 2
-    noise = estimate_noise_power(z, times, len(x), sr)
-    posterior_snr = power / noise[:, None]
+    noise = estimate_noise_power(z, times, len(x), sr, n_fft)[:, None]
+    if first_pass is not None:
+        noise = residual_noise_power(power, first_pass, noise, sr, n_fft)
+    noise = np.broadcast_to(noise, power.shape)   # (주파수, 프레임)
+    posterior_snr = power / noise
 
     # 1단계: decision-directed 사전 SNR + log-MMSE 이득
     stage1 = np.empty_like(z)
-    previous_clean_power = np.zeros_like(noise)
+    previous_clean_power = np.zeros(z.shape[0])
     for frame in range(z.shape[1]):
         instantaneous = np.maximum(posterior_snr[:, frame] - 1.0, 0.0)
         if frame == 0:
             prior_snr = instantaneous
         else:
-            prior_snr = (SNR_SMOOTHING * previous_clean_power / noise
+            prior_snr = (SNR_SMOOTHING * previous_clean_power / noise[:, frame]
                          + (1 - SNR_SMOOTHING) * instantaneous)
         gain = log_mmse_gain(prior_snr, posterior_snr[:, frame])
         stage1[:, frame] = gain * z[:, frame]
         previous_clean_power = np.abs(stage1[:, frame]) ** 2
 
     # 2단계: 하모닉 재생성. 반파 정류(비선형)가 제거된 하모닉 성분을 다시 만들어 낸다.
-    regenerated = np.maximum(istft(stage1, len(x), sr), 0.0)
-    _, _, z_regen = stft(regenerated, sr)
+    regenerated = np.maximum(istft(stage1, len(x), sr, n_fft), 0.0)
+    _, _, z_regen = stft(regenerated, sr, n_fft)
     stage1_power = np.abs(stage1) ** 2
     regen_power = np.abs(z_regen) ** 2
     harmonic_power = (regen_power * HARMONIC_SCALE
                       * stage1_power.sum() / max(regen_power.sum(), 1e-18))
     prior_snr = (HARMONIC_MIX * stage1_power
-                 + (1 - HARMONIC_MIX) * harmonic_power) / noise[:, None]
+                 + (1 - HARMONIC_MIX) * harmonic_power) / noise
     gain = log_mmse_gain(prior_snr, posterior_snr)
-    return istft(gain * z, len(x), sr)
+    return istft(gain * z, len(x), sr, n_fft)
+
+
+def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
+    """1채널 Noisy 파형을 받아 같은 길이의 잡음 제거 파형을 반환한다.
+
+    창 길이가 다른 여러 STFT 로 각각 처리한 결과를 파형 평균한다 (다중 해상도 결합).
+    1차 결과로 잡음 PSD 를 다시 추정한 뒤 같은 과정을 한 번 더 수행한다.
+    """
+    x = np.asarray(noisy, dtype=np.float64)
+    first = np.mean([denoise_single(x, sr, n) for n in FFT_SIZES], axis=0)
+    return np.mean([denoise_single(x, sr, n, first) for n in FFT_SIZES], axis=0)
 
 
 def process_file(src: Path, dst: Path) -> None:
