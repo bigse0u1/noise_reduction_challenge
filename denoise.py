@@ -1,4 +1,4 @@
-"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed, 하모닉 재생성, 다중 해상도, 잔차 기반 잡음 재추정).
+"""전통적 신호 처리 기반 음성 잡음 제거 (log-MMSE, decision-directed, 하모닉 재생성, 켑스트럼 시간 평활, 다중 해상도, 잔차 기반 잡음 재추정).
 
 input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 저장한다.
 
@@ -12,6 +12,8 @@ input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 
   - 이득: Wiener 이득 대신 log-MMSE 이득 (Ephraim & Malah, 1985), 이득 하한 0.01
   - 하모닉 재생성 (Plapous et al., 2006 의 HRNR 을 단순화): 1단계 결과에 반파 정류를 적용해
     제거된 하모닉을 복원한 스펙트럼으로 사전 SNR 을 다시 추정하고 이득을 한 번 더 구한다.
+  - 선택적 켑스트럼 시간 평활 (Breithaupt, Gerkmann & Martin, 2008): 켑스트럼 계수별로 시간 평활
+    강도를 달리한 사전 SNR 을 2단계 사전 SNR 과 로그 영역에서 0.2 비중으로 결합
   - 다중 해상도: STFT 창 길이 5가지(768~3072)로 각각 처리한 결과를 평균
   - 잔차 기반 잡음 재추정: 1차 결과가 제거한 성분(잔차)의 파워를 시간 평활해
     시간에 따라 변하는 잡음 PSD 를 만들고, 이것으로 전체 과정을 한 번 더 수행
@@ -36,6 +38,10 @@ SNR_SMOOTHING = 0.97    # decision-directed 평활 계수 a
 GAIN_FLOOR = 0.01       # 이득 하한 g_min
 HARMONIC_SCALE = 0.5    # 재생성 하모닉 파워의 크기 (1단계 파워 대비)
 HARMONIC_MIX = 0.5      # 2단계 사전 SNR 에서 1단계 파워가 차지하는 비중 ρ
+CEPSTRAL_WEIGHT = 0.2      # 2단계 사전 SNR 에서 켑스트럼 평활 추정의 비중 (로그 영역)
+CEPSTRAL_ALPHA_ENV = 0.5   # 포락선 계수(1 ms 미만 quefrency)의 평활 계수 (8 ms hop 기준)
+CEPSTRAL_ALPHA_PITCH = 0.5 # 음높이 피크 주변 계수의 평활 계수 (8 ms hop 기준)
+CEPSTRAL_ALPHA_REST = 0.97 # 나머지 계수의 평활 계수 (8 ms hop 기준)
 RESIDUAL_EXPONENT = 4      # 잔차 파워 (1 - g²)^p · |Y|² 의 지수 p
 RESIDUAL_SMOOTH_MS = 600   # 잔차 파워의 시간 평활 길이
 RESIDUAL_WEIGHT = 0.85     # 잔차 기반 잡음 PSD 의 비중 (나머지는 고정 잡음 PSD, 로그 영역 혼합)
@@ -83,6 +89,38 @@ def log_mmse_gain(prior_snr: np.ndarray, posterior_snr: np.ndarray) -> np.ndarra
     wiener = prior_snr / (1 + prior_snr)
     v = np.maximum(wiener * posterior_snr, 1e-8)
     return np.clip(wiener * np.exp(0.5 * exp1(v)), GAIN_FLOOR, 1)
+
+
+def cepstral_prior_snr(power: np.ndarray, noise: np.ndarray, sr: int, n_fft: int) -> np.ndarray:
+    """선택적 켑스트럼 시간 평활로 사전 SNR 을 추정한다 (Breithaupt, Gerkmann & Martin, 2008).
+
+    ML 음성 파워 max(|Y|² - λN, ξmin·λN) 의 로그 스펙트럼을 켑스트럼으로 바꾸고,
+    포락선과 음높이 피크 계수는 약하게, 나머지 계수는 강하게 시간 평활한 뒤 되돌린다.
+    """
+    hop_ms = 1000.0 * (n_fft // HOP_DIVISOR) / sr
+    scale = hop_ms / 8.0                                    # 시간 상수를 hop 길이에 맞춤
+    a_env, a_pitch, a_rest = (CEPSTRAL_ALPHA_ENV ** scale, CEPSTRAL_ALPHA_PITCH ** scale,
+                              CEPSTRAL_ALPHA_REST ** scale)
+    xi_min = 10 ** (-25 / 10)
+    log_ml = np.log(np.maximum(power - noise, xi_min * noise))
+    q = np.arange(n_fft)
+    q_sym = np.minimum(q, n_fft - q)                        # 켑스트럼 대칭 인덱스
+    q_env = max(1, int(round(0.001 * sr)))                  # 1 ms
+    q_lo, q_hi = int(sr / 400), min(int(sr / 70), n_fft // 2 - 2)   # 음높이 70~400 Hz
+    base_alpha = np.where(q_sym < q_env, a_env, a_rest)
+    smoothed = None
+    out = np.empty(power.shape)
+    for frame in range(power.shape[1]):
+        cep = np.fft.irfft(log_ml[:, frame], n_fft)
+        alpha = base_alpha.copy()
+        if q_hi > q_lo:
+            q0 = q_lo + int(np.argmax(cep[q_lo:q_hi]))
+            if cep[q0] > 0.2:                               # 뚜렷한 음높이 피크만 보호
+                alpha[np.abs(q_sym - q0) <= 2] = a_pitch
+        smoothed = cep if smoothed is None else alpha * smoothed + (1 - alpha) * cep
+        out[:, frame] = np.fft.rfft(smoothed, n_fft).real
+    # 로그 영역 평활의 편향 보정 (지수분포 로그 평균 = log λ - 오일러 상수)
+    return np.maximum(np.exp(out + 0.5772) / noise, xi_min)
 
 
 def residual_noise_power(power: np.ndarray, first_pass: np.ndarray, fixed: np.ndarray,
@@ -138,6 +176,8 @@ def denoise_single(x: np.ndarray, sr: int, n_fft: int, first_pass: np.ndarray | 
                       * stage1_power.sum() / max(regen_power.sum(), 1e-18))
     prior_snr = (HARMONIC_MIX * stage1_power
                  + (1 - HARMONIC_MIX) * harmonic_power) / noise
+    prior_snr = (prior_snr ** (1 - CEPSTRAL_WEIGHT)
+                 * cepstral_prior_snr(power, noise, sr, n_fft) ** CEPSTRAL_WEIGHT)
     gain = log_mmse_gain(prior_snr, posterior_snr)
     return istft(gain * z, len(x), sr, n_fft)
 
