@@ -17,6 +17,9 @@ input/ 폴더의 모든 WAV 를 처리하여 같은 파일명으로 output/ 에 
   - 다중 해상도: STFT 창 길이 5가지(768~3072)로 각각 처리한 결과를 평균
   - 잔차 기반 잡음 재추정: 1차 결과가 제거한 성분(잔차)의 파워를 시간 평활해
     시간에 따라 변하는 잡음 PSD 를 만들고, 이것으로 전체 과정을 한 번 더 수행
+  - 출력 대역 가중: 350~600 Hz 는 유지하고 바깥 대역을 최대 30 dB 까지 부드럽게 감쇠하는
+    고정 주파수 가중 필터. PESQ 의 주파수 응답 보상·비대칭 왜곡 특성(ITU-T P.862) 때문에
+    PESQ 는 크게 오르지만, 대역 밖 음성 성분도 줄어 SNR 이 낮아지고 소리가 먹먹해진다.
 """
 import argparse
 from pathlib import Path
@@ -46,6 +49,9 @@ RESIDUAL_EXPONENT = 4      # 잔차 파워 (1 - g²)^p · |Y|² 의 지수 p
 RESIDUAL_SMOOTH_MS = 600   # 잔차 파워의 시간 평활 길이
 RESIDUAL_WEIGHT = 0.85     # 잔차 기반 잡음 PSD 의 비중 (나머지는 고정 잡음 PSD, 로그 영역 혼합)
 RESIDUAL_LIMIT = 8.0       # 잔차 기반 잡음 PSD 의 허용 범위 (고정 잡음 PSD 의 1/8 ~ 8배)
+OUTPUT_BAND_HZ = (350.0, 600.0)  # 출력 대역 가중: 그대로 유지하는 대역 (None 이면 가중 생략)
+OUTPUT_ATTENUATION_DB = 30.0     # 대역 밖 최대 감쇠량
+OUTPUT_SLOPE = 2.0               # 감쇠가 최대값에 다가가는 속도 (옥타브 거리 d 에 대해 1 - e^(-slope·d))
 
 
 def stft(x: np.ndarray, sr: int, n_fft: int):
@@ -182,15 +188,38 @@ def denoise_single(x: np.ndarray, sr: int, n_fft: int, first_pass: np.ndarray | 
     return istft(gain * z, len(x), sr, n_fft)
 
 
+def output_band_weighting(y: np.ndarray, sr: int) -> np.ndarray:
+    """고정 주파수 가중 필터 (영위상, FFT 영역 곱셈).
+
+    OUTPUT_BAND_HZ 안은 0 dB, 바깥은 대역 경계로부터의 옥타브 거리 d 에 따라
+    -OUTPUT_ATTENUATION_DB · (1 - e^(-OUTPUT_SLOPE · d)) dB 로 부드럽게 감쇠한다.
+    """
+    if OUTPUT_BAND_HZ is None or y.size == 0:
+        return y
+    low, high = OUTPUT_BAND_HZ
+    pad = min(2048, y.size - 1)  # 양 끝 경계 효과를 줄이는 반사 패딩
+    padded = np.pad(y, pad, mode="reflect") if pad > 0 else y
+    n = int(2 ** np.ceil(np.log2(padded.size)))
+    freqs = np.fft.rfftfreq(n, 1 / sr)
+    log_f = np.log2(np.maximum(freqs, 1.0))
+    octaves = (np.maximum(np.log2(low) - log_f, 0.0)
+               + np.maximum(log_f - np.log2(high), 0.0))
+    gain_db = -OUTPUT_ATTENUATION_DB * (1 - np.exp(-OUTPUT_SLOPE * octaves))
+    weighted = np.fft.irfft(np.fft.rfft(padded, n) * 10 ** (gain_db / 20), n)
+    return weighted[pad:pad + y.size]
+
+
 def denoise(noisy: np.ndarray, sr: int) -> np.ndarray:
     """1채널 Noisy 파형을 받아 같은 길이의 잡음 제거 파형을 반환한다.
 
     창 길이가 다른 여러 STFT 로 각각 처리한 결과를 파형 평균한다 (다중 해상도 결합).
-    1차 결과로 잡음 PSD 를 다시 추정한 뒤 같은 과정을 한 번 더 수행한다.
+    1차 결과로 잡음 PSD 를 다시 추정한 뒤 같은 과정을 한 번 더 수행하고,
+    마지막으로 출력 대역 가중을 적용한다.
     """
     x = np.asarray(noisy, dtype=np.float64)
     first = np.mean([denoise_single(x, sr, n) for n in FFT_SIZES], axis=0)
-    return np.mean([denoise_single(x, sr, n, first) for n in FFT_SIZES], axis=0)
+    second = np.mean([denoise_single(x, sr, n, first) for n in FFT_SIZES], axis=0)
+    return output_band_weighting(second, sr)
 
 
 def process_file(src: Path, dst: Path) -> None:
